@@ -61,7 +61,11 @@
     origDrawImage.call(cleanCanvas.getContext('2d'), main, 0, 0);
 
     if (!addonState.originalDataUrl) {
-      addonState.originalDataUrl = cleanCanvas.toDataURL('image/jpeg', 0.9);
+      try {
+        addonState.originalDataUrl = cleanCanvas.toDataURL('image/jpeg', 0.9);
+      } catch (e) {
+        console.warn('Initial capture failed:', e);
+      }
     }
   }
 
@@ -71,7 +75,6 @@
 
     if (!hostRenderScheduled) {
       hostRenderScheduled = true;
-      // 本体の1フレーム分の描画がすべて完了した直後に1回だけ処理する
       setTimeout(() => {
         hostRenderScheduled = false;
         captureCleanCanvas();
@@ -226,7 +229,7 @@
       color: #0e0f12;
       border: none;
       border-radius: 10px;
-      padding: 10px;
+      padding: 11px;
       font-size: 13px;
       font-weight: 800;
       cursor: pointer;
@@ -274,7 +277,7 @@
       border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
-      z-index: 10000;
+      z-index: 10010;
       opacity: 0;
       pointer-events: none;
       transition: all 0.25s ease;
@@ -306,7 +309,7 @@
     toast.textContent = msg;
     toast.classList.add('show');
     clearTimeout(toast._timer);
-    toast._timer = setTimeout(() => toast.classList.remove('show'), 2200);
+    toast._timer = setTimeout(() => toast.classList.remove('show'), 2400);
   }
 
   function triggerShutterFlash() {
@@ -470,7 +473,6 @@
     addonState.isApplying = true;
     try {
       const ctx = canvas.getContext('2d');
-      // 毎回必ず「素の画像」でキャンバスをリセットしてから描く
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       origDrawImage.call(ctx, cleanCanvas, 0, 0);
 
@@ -487,13 +489,12 @@
     }
   }
 
-  // 初回ロード時にすでに描画済みの場合のバックアップ
   setTimeout(() => {
     if (!cleanCanvas.width) captureCleanCanvas();
   }, 200);
 
   // ==========================================
-  // 5. 書き出し・Before/After・コンタクトシート生成
+  // 5. iPhone PWA完全対応の保存処理（共有シート＋長押し保存モーダル）
   // ==========================================
   function createProcessedExportCanvas() {
     const src = getMainCanvas();
@@ -526,11 +527,80 @@
     return out;
   }
 
-  function downloadCanvas(canvas, filename) {
-    const link = document.createElement('a');
-    link.download = filename;
-    link.href = canvas.toDataURL('image/jpeg', 0.94);
-    link.click();
+  function showImageSaveModal(dataUrl, titleText) {
+    let modal = document.getElementById('hb-save-modal');
+    if (!modal) {
+      modal = document.createElement('div');
+      modal.id = 'hb-save-modal';
+      modal.style.cssText = `
+        position: fixed; inset: 0; z-index: 10005;
+        background: rgba(9, 10, 13, 0.95);
+        display: flex; flex-direction: column; align-items: center; justify-content: center;
+        padding: 20px; color: #f0f2f5; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      `;
+      document.body.appendChild(modal);
+    }
+    modal.innerHTML = `
+      <div style="font-size:15px;font-weight:800;color:#f5a623;margin-bottom:6px;">${titleText}</div>
+      <div style="font-size:12px;color:#d0d5dd;margin-bottom:14px;text-align:center;line-height:1.5;">
+        画像を<b>長押し →「写真に保存」</b>を押すと<br>iPhoneの写真アプリに直接保存できます
+      </div>
+      <img src="${dataUrl}" style="max-width:100%;max-height:62vh;border-radius:10px;border:1px solid #2c303b;box-shadow:0 8px 28px rgba(0,0,0,0.7);">
+      <button id="hb-modal-close" style="margin-top:18px;background:#f5a623;color:#0e0f12;border:none;border-radius:999px;padding:11px 32px;font-size:13px;font-weight:800;cursor:pointer;">閉じる</button>
+    `;
+    modal.style.display = 'flex';
+    modal.querySelector('#hb-modal-close').onclick = () => {
+      modal.style.display = 'none';
+    };
+  }
+
+  function downloadCanvas(canvas, filename, titleText = '現像完了') {
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.94);
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+
+    if (!canvas.toBlob) {
+      showImageSaveModal(dataUrl, titleText);
+      return;
+    }
+
+    canvas.toBlob(async (blob) => {
+      if (!blob) {
+        showImageSaveModal(dataUrl, titleText);
+        return;
+      }
+
+      // iPhone / スマホでは共有シート（「画像を保存」）を優先起動
+      if (isMobile && navigator.share) {
+        try {
+          const file = new File([blob], filename, { type: 'image/jpeg' });
+          if (!navigator.canShare || navigator.canShare({ files: [file] })) {
+            await navigator.share({
+              files: [file],
+              title: 'HASSURUBLAD'
+            });
+            showToast('✅ 共有メニューから「画像を保存」を選んでください');
+            return;
+          }
+        } catch (err) {
+          if (err && err.name === 'AbortError') return;
+        }
+      }
+
+      // フォールバック：PCダウンロード or スマホ長押し保存モーダル
+      if (isMobile) {
+        showImageSaveModal(dataUrl, titleText);
+      } else {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.download = filename;
+        link.href = url;
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        showToast('💾 画像を保存しました！');
+      }
+    }, 'image/jpeg', 0.94);
   }
 
   document.addEventListener('change', (e) => {
@@ -545,14 +615,18 @@
 
   function exportBeforeAfter() {
     const afterCanvas = createProcessedExportCanvas();
-    if (!afterCanvas) return;
+    if (!afterCanvas) {
+      showToast('⚠️ 画像が見つかりませんでした');
+      return;
+    }
 
-    const img = new Image();
-    img.onload = () => {
+    showToast('⏳ Before / After 比較画像を生成中...');
+
+    const buildCompare = (beforeSource) => {
       const w = afterCanvas.width;
       const h = afterCanvas.height;
-      const gap = Math.round(w * 0.02);
-      const labelH = Math.round(h * 0.06);
+      const gap = Math.max(8, Math.round(w * 0.02));
+      const labelH = Math.max(32, Math.round(h * 0.065));
 
       const out = document.createElement('canvas');
       out.width = w * 2 + gap;
@@ -562,7 +636,9 @@
       ctx.fillStyle = '#0e0f12';
       ctx.fillRect(0, 0, out.width, out.height);
 
-      origDrawImage.call(ctx, img, 0, 0, w, h);
+      if (beforeSource) {
+        origDrawImage.call(ctx, beforeSource, 0, 0, w, h);
+      }
       origDrawImage.call(ctx, afterCanvas, w + gap, 0, w, h);
 
       ctx.fillStyle = '#949ba8';
@@ -573,10 +649,19 @@
       ctx.fillStyle = '#f5a623';
       ctx.fillText('AFTER  •  HASSURUBLAD', w + gap + w / 2, h + labelH * 0.68);
 
-      downloadCanvas(out, `hassurublad_compare_${Date.now()}.jpg`);
-      showToast('🌓 Before / After 比較画像を保存しました！');
+      downloadCanvas(out, `hassurublad_compare_${Date.now()}.jpg`, '🌓 Before / After 比較画像');
     };
-    img.src = addonState.originalDataUrl || cleanCanvas.toDataURL('image/jpeg', 0.9);
+
+    const srcUrl = addonState.originalDataUrl || (cleanCanvas.width ? cleanCanvas.toDataURL('image/jpeg', 0.9) : null);
+    if (!srcUrl) {
+      buildCompare(cleanCanvas.width ? cleanCanvas : afterCanvas);
+      return;
+    }
+
+    const img = new Image();
+    img.onload = () => buildCompare(img);
+    img.onerror = () => buildCompare(cleanCanvas.width ? cleanCanvas : afterCanvas);
+    img.src = srcUrl;
   }
 
   // ==========================================
@@ -788,8 +873,7 @@
 
         loaded++;
         if (loaded === filmRoll.length) {
-          downloadCanvas(out, `hassurublad_contact_sheet_${Date.now()}.jpg`);
-          showToast('🎞️ コンタクトシートを現像・保存しました！');
+          downloadCanvas(out, `hassurublad_contact_sheet_${Date.now()}.jpg`, '🎞️ コンタクトシート');
         }
       };
       img.src = dataUrl;
@@ -920,8 +1004,7 @@
       body.querySelector('#hb-export-effect').addEventListener('click', () => {
         const c = createProcessedExportCanvas();
         if (c) {
-          downloadCanvas(c, `hassurublad_film_${Date.now()}.jpg`);
-          showToast('💾 写真を保存しました！');
+          downloadCanvas(c, `hassurublad_film_${Date.now()}.jpg`, '💾 エフェクト適用済み写真');
         }
       });
     } else {
