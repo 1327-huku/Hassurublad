@@ -1,11 +1,17 @@
 (() => {
   'use strict';
 
+  // 二重読み込み防止
+  if (window.__HASSURUBLAD_ADDON_LOADED__) return;
+  window.__HASSURUBLAD_ADDON_LOADED__ = true;
+
   // ==========================================
-  // 1. 状態管理 & 初期設定
+  // 1. 状態管理 & 定数設定
   // ==========================================
+  const ADDON_VERSION = 'v2.1';
   const STORAGE_RECIPES = 'hassurublad_my_recipes_v1';
   const STORAGE_ROLL = 'hassurublad_film_roll_v1';
+  const MAX_CANVAS_PIXELS = 16777216; // iOS Safari安全上限 (4096x4096 = 16.7MP)
 
   const addonState = {
     dateMode: 'off',       // 'off' | 'today' | '90s' | 'custom'
@@ -14,16 +20,28 @@
     leakSeed: 0,           // 0 = OFF, >0 = 光漏れシード値
     leakOpacity: 0.65,
     shakeEnabled: false,
-    originalDataUrl: null,
+    originalBitmap: null,  // Exif補正済みの元画像 (ImageBitmap or HTMLImageElement)
+    originalDataUrl: null, // サンプル画像等のフォールバック用DataURL
     isApplying: false,
+    interceptHostExport: false,
+    bypassHostClick: false,
+    onHostCanvasCaptured: null,
     activeTab: 'effects'
   };
 
   let filmRoll = loadJson(STORAGE_ROLL, []);
   let myRecipes = loadJson(STORAGE_RECIPES, [null, null, null, null, null]);
 
-  // エフェクト適用前の「素の現像画像」を保持する裏キャンバス
-  const cleanCanvas = document.createElement('canvas');
+  // プレビュー用「素の現像画像」保持キャンバス
+  const cleanCanvas = createInternalCanvas();
+
+  function createInternalCanvas(w = 0, h = 0) {
+    const c = document.createElement('canvas');
+    c._hbInternal = true;
+    if (w > 0) c.width = w;
+    if (h > 0) c.height = h;
+    return c;
+  }
 
   function loadJson(key, fallback) {
     try {
@@ -37,8 +55,10 @@
   function saveJson(key, data) {
     try {
       localStorage.setItem(key, JSON.stringify(data));
+      return true;
     } catch (e) {
-      console.warn('Storage limit:', e);
+      console.warn('Storage limit exceeded:', e);
+      return false;
     }
   }
 
@@ -46,11 +66,25 @@
     return document.getElementById('mainCanvas') || document.querySelector('canvas');
   }
 
+  function getSafeDimensions(w, h, maxPixels = MAX_CANVAS_PIXELS) {
+    const pixels = w * h;
+    if (pixels <= maxPixels) return { w, h };
+    const scale = Math.sqrt(maxPixels / pixels);
+    return {
+      w: Math.round(w * scale),
+      h: Math.round(h * scale)
+    };
+  }
+
   // ==========================================
-  // 2. 本体キャンバスの更新検知（無限重ね描き防止）
+  // 2. ブラウザ標準APIのフック（描画検知 & フル解像度書き出し横取り）
   // ==========================================
   const origDrawImage = CanvasRenderingContext2D.prototype.drawImage;
   const origPutImageData = CanvasRenderingContext2D.prototype.putImageData;
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  const origToBlob = HTMLCanvasElement.prototype.toBlob;
+  const origAnchorClick = HTMLAnchorElement.prototype.click;
+
   let hostRenderScheduled = false;
 
   function captureCleanCanvas() {
@@ -60,12 +94,11 @@
     cleanCanvas.height = main.height;
     origDrawImage.call(cleanCanvas.getContext('2d'), main, 0, 0);
 
-    if (!addonState.originalDataUrl) {
+    // まだ元画像が記録されていない場合（起動直後のサンプル画像など）のみ初期キャプチャ
+    if (!addonState.originalBitmap && !addonState.originalDataUrl) {
       try {
-        addonState.originalDataUrl = cleanCanvas.toDataURL('image/jpeg', 0.9);
-      } catch (e) {
-        console.warn('Initial capture failed:', e);
-      }
+        addonState.originalDataUrl = origToDataURL.call(cleanCanvas, 'image/jpeg', 0.95);
+      } catch (e) {}
     }
   }
 
@@ -95,8 +128,92 @@
     return res;
   };
 
+  // 本体が書き出すキャンバスにエフェクトを焼き込み、6x6なら1:1クロップする
+  function buildFinalCanvasFromHost(sourceCanvas) {
+    const main = getMainCanvas();
+    const out = createInternalCanvas(sourceCanvas.width, sourceCanvas.height);
+    const ctx = out.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+
+    // mainCanvas自体の場合はすでにプレビューエフェクトが乗っているためcleanCanvasを使う
+    if (sourceCanvas === main && cleanCanvas.width > 0) {
+      origDrawImage.call(ctx, cleanCanvas, 0, 0, out.width, out.height);
+    } else {
+      origDrawImage.call(ctx, sourceCanvas, 0, 0);
+    }
+
+    const hasEffect =
+      addonState.dateMode !== 'off' ||
+      addonState.frameMode !== 'off' ||
+      addonState.leakSeed > 0;
+
+    if (hasEffect) {
+      renderEffectsOnCanvas(ctx, out.width, out.height);
+    }
+
+    if (addonState.frameMode === '6x6' && out.width !== out.height) {
+      const sq = Math.min(out.width, out.height);
+      const sqCanvas = createInternalCanvas(sq, sq);
+      origDrawImage.call(
+        sqCanvas.getContext('2d'),
+        out,
+        (out.width - sq) / 2,
+        (out.height - sq) / 2,
+        sq,
+        sq,
+        0,
+        0,
+        sq,
+        sq
+      );
+      return sqCanvas;
+    }
+
+    return out;
+  }
+
+  // 本体保存時の toDataURL / toBlob を確実にキャッチ
+  HTMLCanvasElement.prototype.toDataURL = function (...args) {
+    if (!this._hbInternal && addonState.interceptHostExport && this.width > 10) {
+      const finalCanvas = buildFinalCanvasFromHost(this);
+      if (addonState.onHostCanvasCaptured) {
+        const cb = addonState.onHostCanvasCaptured;
+        addonState.onHostCanvasCaptured = null;
+        addonState.interceptHostExport = false;
+        cb(finalCanvas);
+        return 'data:,';
+      }
+      return origToDataURL.apply(finalCanvas, args);
+    }
+    return origToDataURL.apply(this, args);
+  };
+
+  HTMLCanvasElement.prototype.toBlob = function (callback, ...args) {
+    if (!this._hbInternal && addonState.interceptHostExport && this.width > 10) {
+      const finalCanvas = buildFinalCanvasFromHost(this);
+      if (addonState.onHostCanvasCaptured) {
+        const cb = addonState.onHostCanvasCaptured;
+        addonState.onHostCanvasCaptured = null;
+        addonState.interceptHostExport = false;
+        cb(finalCanvas);
+        return;
+      }
+      return origToBlob.call(finalCanvas, callback, ...args);
+    }
+    return origToBlob.call(this, callback, ...args);
+  };
+
+  // 本体が <a download> で自動ダウンロードしようとした場合もブロックして二重発火を防ぐ
+  HTMLAnchorElement.prototype.click = function (...args) {
+    if (addonState.interceptHostExport && this.hasAttribute('download')) {
+      return;
+    }
+    return origAnchorClick.apply(this, args);
+  };
+
   // ==========================================
-  // 3. スタイル注入（本体デザインに統一）
+  // 3. スタイル注入（本体UIに調和するデザイン）
   // ==========================================
   const style = document.createElement('style');
   style.textContent = `
@@ -113,7 +230,7 @@
       font-size: 13px;
       font-weight: 800;
       letter-spacing: 0.05em;
-      box-shadow: 0 6px 20px rgba(245, 166, 35, 0.4);
+      box-shadow: 0 6px 20px rgba(245, 166, 35, 0.45);
       cursor: pointer;
       display: flex;
       align-items: center;
@@ -131,10 +248,10 @@
       background: #17191f;
       border-top: 1px solid #2c303b;
       border-radius: 18px 18px 0 0;
-      box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.75);
+      box-shadow: 0 -10px 30px rgba(0, 0, 0, 0.8);
       color: #f0f2f5;
       font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-      max-height: 76vh;
+      max-height: 78vh;
       display: flex;
       flex-direction: column;
       transform: translateY(105%);
@@ -151,6 +268,7 @@
     }
     .hb-tabs {
       display: flex;
+      align-items: center;
       gap: 8px;
     }
     .hb-tab {
@@ -168,6 +286,11 @@
       color: #0e0f12;
       border-color: #f5a623;
     }
+    .hb-ver-badge {
+      font-size: 10px;
+      color: #6b7280;
+      font-family: monospace;
+    }
     .hb-close {
       background: #1f222a;
       color: #f0f2f5;
@@ -180,7 +303,7 @@
     }
 
     .hb-body {
-      padding: 14px 16px 26px;
+      padding: 14px 16px 28px;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
@@ -216,6 +339,7 @@
       cursor: pointer;
       flex: 1 1 auto;
       text-align: center;
+      touch-action: manipulation;
     }
     .hb-chip.active {
       background: rgba(245, 166, 35, 0.18);
@@ -229,11 +353,12 @@
       color: #0e0f12;
       border: none;
       border-radius: 10px;
-      padding: 11px;
+      padding: 12px;
       font-size: 13px;
       font-weight: 800;
       cursor: pointer;
       margin-top: 6px;
+      touch-action: manipulation;
     }
     .hb-action-btn.secondary {
       background: #2c303b;
@@ -270,18 +395,19 @@
       top: 18px;
       left: 50%;
       transform: translateX(-50%) translateY(-20px);
-      background: rgba(23, 25, 31, 0.95);
+      background: rgba(23, 25, 31, 0.96);
       border: 1px solid #f5a623;
       color: #f0f2f5;
       padding: 8px 16px;
       border-radius: 999px;
       font-size: 12px;
       font-weight: 700;
-      z-index: 10010;
+      z-index: 10020;
       opacity: 0;
       pointer-events: none;
       transition: all 0.25s ease;
       white-space: nowrap;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.6);
     }
     #hb-toast.show {
       opacity: 1;
@@ -291,7 +417,7 @@
       position: fixed;
       inset: 0;
       background: #fff;
-      z-index: 10001;
+      z-index: 10015;
       opacity: 0;
       pointer-events: none;
       transition: opacity 0.15s ease-out;
@@ -309,7 +435,7 @@
     toast.textContent = msg;
     toast.classList.add('show');
     clearTimeout(toast._timer);
-    toast._timer = setTimeout(() => toast.classList.remove('show'), 2400);
+    toast._timer = setTimeout(() => toast.classList.remove('show'), 2500);
   }
 
   function triggerShutterFlash() {
@@ -325,7 +451,7 @@
   }
 
   // ==========================================
-  // 4. ビジュアルエフェクト描画エンジン（必ず素の画像から1回だけ描画）
+  // 4. ビジュアルエフェクト描画エンジン
   // ==========================================
   function seededRandom(seed) {
     const x = Math.sin(seed * 9999.91) * 10000;
@@ -365,9 +491,7 @@
     let contentRect = { x: 0, y: 0, w, h };
 
     if (addonState.frameMode === '6x6') {
-      const temp = document.createElement('canvas');
-      temp.width = w;
-      temp.height = h;
+      const temp = createInternalCanvas(w, h);
       origDrawImage.call(temp.getContext('2d'), ctx.canvas, 0, 0);
 
       const sq = Math.min(w, h);
@@ -397,16 +521,14 @@
       });
 
       // フィルムエッジ印字
-      ctx.fillStyle = 'rgba(245, 166, 35, 0.8)';
-      ctx.font = `bold ${Math.max(9, Math.round(border * 0.36))}px monospace`;
+      ctx.fillStyle = 'rgba(245, 166, 35, 0.85)';
+      ctx.font = `bold ${Math.max(11, Math.round(border * 0.36))}px monospace`;
       ctx.fillText('HASSURUBLAD 6x6   120 FILM   ► 12', dx, dy - border * 0.3);
 
       contentRect = { x: dx, y: dy, w: inner, h: inner };
       ctx.restore();
     } else if (addonState.frameMode === 'polaroid') {
-      const temp = document.createElement('canvas');
-      temp.width = w;
-      temp.height = h;
+      const temp = createInternalCanvas(w, h);
       origDrawImage.call(temp.getContext('2d'), ctx.canvas, 0, 0);
 
       ctx.save();
@@ -445,7 +567,7 @@
       }
 
       ctx.save();
-      const fontSize = Math.max(14, Math.round(contentRect.w * 0.036));
+      const fontSize = Math.max(16, Math.round(contentRect.w * 0.036));
       ctx.font = `bold ${fontSize}px "Courier New", monospace`;
       ctx.textAlign = 'right';
       ctx.textBaseline = 'bottom';
@@ -494,178 +616,325 @@
   }, 200);
 
   // ==========================================
-  // 5. iPhone PWA完全対応の保存処理（共有シート＋長押し保存モーダル）
+  // 5. 元画像の読み込み検知（2枚目以降のリセット＆Exif縦横補正）
   // ==========================================
-  function createProcessedExportCanvas() {
-    const src = getMainCanvas();
-    if (!src) return null;
+  document.addEventListener('change', async (e) => {
+    if (e.target && e.target.type === 'file' && e.target.files && e.target.files[0]) {
+      const file = e.target.files[0];
+      // 古い画像のキャッシュを完全クリア
+      addonState.originalBitmap = null;
+      addonState.originalDataUrl = null;
 
-    if (addonState.frameMode === '6x6') {
-      const sq = Math.min(src.width, src.height);
-      const out = document.createElement('canvas');
-      out.width = sq;
-      out.height = sq;
-      origDrawImage.call(
-        out.getContext('2d'),
-        src,
-        (src.width - sq) / 2,
-        (src.height - sq) / 2,
-        sq,
-        sq,
-        0,
-        0,
-        sq,
-        sq
-      );
-      return out;
+      try {
+        if (typeof createImageBitmap === 'function') {
+          // Exifの向きを自動補正してデコード
+          addonState.originalBitmap = await createImageBitmap(file);
+        } else {
+          const reader = new FileReader();
+          reader.onload = (ev) => {
+            addonState.originalDataUrl = ev.target.result;
+            const img = new Image();
+            img.onload = () => {
+              addonState.originalBitmap = img;
+            };
+            img.src = ev.target.result;
+          };
+          reader.readAsDataURL(file);
+        }
+      } catch (err) {
+        console.warn('Bitmap decode fallback:', err);
+      }
     }
+  }, true);
 
-    const out = document.createElement('canvas');
-    out.width = src.width;
-    out.height = src.height;
-    origDrawImage.call(out.getContext('2d'), src, 0, 0);
-    return out;
+  // ==========================================
+  // 6. フル解像度書き出し & iOS PWA 100%確実保存モーダル
+  // ==========================================
+  function findHostSaveButton() {
+    const buttons = Array.from(document.querySelectorAll('button'));
+    return buttons.find((b) => {
+      if (b.id && b.id.startsWith('hb-')) return false;
+      if (b.closest('#hb-addon-drawer') || b.closest('#hb-save-modal')) return false;
+      const txt = (b.textContent || '').trim();
+      return txt === '保存' || txt.includes('保存');
+    });
   }
 
-  function showImageSaveModal(dataUrl, titleText) {
+  function getSourceDimensions(imgOrBitmap) {
+    if (!imgOrBitmap) return { w: 0, h: 0 };
+    return {
+      w: imgOrBitmap.naturalWidth || imgOrBitmap.width || 0,
+      h: imgOrBitmap.naturalHeight || imgOrBitmap.height || 0
+    };
+  }
+
+  // 本体のフル解像度書き出しを2.2秒タイムアウトで安全に横取りする
+  function generateFullResProcessedCanvas() {
+    return new Promise((resolve) => {
+      const hostSaveBtn = findHostSaveButton();
+
+      const buildFallbackFullRes = () => {
+        const src = getMainCanvas();
+        if (!src) {
+          resolve(null);
+          return;
+        }
+
+        let targetW = src.width;
+        let targetH = src.height;
+        const origDims = getSourceDimensions(addonState.originalBitmap);
+        if (origDims.w > 0 && origDims.h > 0) {
+          const safe = getSafeDimensions(origDims.w, origDims.h);
+          targetW = safe.w;
+          targetH = safe.h;
+        }
+
+        const out = createInternalCanvas(targetW, targetH);
+        const ctx = out.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
+
+        const base = cleanCanvas.width > 0 ? cleanCanvas : src;
+        origDrawImage.call(ctx, base, 0, 0, targetW, targetH);
+
+        const hasEffect =
+          addonState.dateMode !== 'off' ||
+          addonState.frameMode !== 'off' ||
+          addonState.leakSeed > 0;
+
+        if (hasEffect) {
+          renderEffectsOnCanvas(ctx, targetW, targetH);
+        }
+
+        if (addonState.frameMode === '6x6' && targetW !== targetH) {
+          const sq = Math.min(targetW, targetH);
+          const sqOut = createInternalCanvas(sq, sq);
+          origDrawImage.call(
+            sqOut.getContext('2d'),
+            out,
+            (targetW - sq) / 2,
+            (targetH - sq) / 2,
+            sq,
+            sq,
+            0,
+            0,
+            sq,
+            sq
+          );
+          resolve(sqOut);
+          return;
+        }
+
+        resolve(out);
+      };
+
+      if (!hostSaveBtn) {
+        buildFallbackFullRes();
+        return;
+      }
+
+      let resolved = false;
+      const timer = setTimeout(() => {
+        if (!resolved) {
+          resolved = true;
+          addonState.interceptHostExport = false;
+          addonState.onHostCanvasCaptured = null;
+          buildFallbackFullRes();
+        }
+      }, 2200);
+
+      addonState.interceptHostExport = true;
+      addonState.onHostCanvasCaptured = (capturedCanvas) => {
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(timer);
+          resolve(capturedCanvas);
+        }
+      };
+
+      addonState.bypassHostClick = true;
+      try {
+        hostSaveBtn.click();
+      } finally {
+        addonState.bypassHostClick = false;
+      }
+    });
+  }
+
+  // iPhoneのユーザージェスチャー制限を100%回避する保存モーダル
+  function presentSaveModal(canvas, filename, titleText = '現像完了') {
+    const quality = 0.97;
+    const dimsText = `${canvas.width} × ${canvas.height} px`;
+    const dataUrl = origToDataURL.call(canvas, 'image/jpeg', quality);
+
+    // Blobも事前生成して共有ボタン押下時に0msで渡せるようにする
+    let readyBlob = null;
+    origToBlob.call(canvas, (blob) => {
+      readyBlob = blob;
+    }, 'image/jpeg', quality);
+
     let modal = document.getElementById('hb-save-modal');
     if (!modal) {
       modal = document.createElement('div');
       modal.id = 'hb-save-modal';
       modal.style.cssText = `
-        position: fixed; inset: 0; z-index: 10005;
-        background: rgba(9, 10, 13, 0.95);
+        position: fixed; inset: 0; z-index: 10010;
+        background: rgba(9, 10, 13, 0.96);
         display: flex; flex-direction: column; align-items: center; justify-content: center;
-        padding: 20px; color: #f0f2f5; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+        padding: 18px; color: #f0f2f5; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
       `;
       document.body.appendChild(modal);
     }
+
+    const canNativeShare = typeof navigator !== 'undefined' && !!navigator.share;
+
     modal.innerHTML = `
-      <div style="font-size:15px;font-weight:800;color:#f5a623;margin-bottom:6px;">${titleText}</div>
-      <div style="font-size:12px;color:#d0d5dd;margin-bottom:14px;text-align:center;line-height:1.5;">
-        画像を<b>長押し →「写真に保存」</b>を押すと<br>iPhoneの写真アプリに直接保存できます
+      <div style="font-size:15px;font-weight:800;color:#f5a623;margin-bottom:4px;">${titleText}</div>
+      <div style="font-size:11px;color:#949ba8;margin-bottom:10px;">出力解像度: <b style="color:#f0f2f5;">${dimsText}</b></div>
+      <img src="${dataUrl}" style="max-width:100%;max-height:54vh;border-radius:10px;border:1px solid #2c303b;box-shadow:0 8px 28px rgba(0,0,0,0.75);object-fit:contain;">
+      <div style="font-size:12px;color:#d0d5dd;margin-top:12px;text-align:center;line-height:1.5;">
+        上の画像を<b>長押し →「写真に保存」</b><br>または下のボタンから写真アプリに保存できます
       </div>
-      <img src="${dataUrl}" style="max-width:100%;max-height:62vh;border-radius:10px;border:1px solid #2c303b;box-shadow:0 8px 28px rgba(0,0,0,0.7);">
-      <button id="hb-modal-close" style="margin-top:18px;background:#f5a623;color:#0e0f12;border:none;border-radius:999px;padding:11px 32px;font-size:13px;font-weight:800;cursor:pointer;">閉じる</button>
+      <div style="display:flex;gap:10px;width:100%;max-width:340px;margin-top:14px;">
+        ${canNativeShare ? `<button id="hb-modal-share" style="flex:2;background:#f5a623;color:#0e0f12;border:none;border-radius:999px;padding:12px 16px;font-size:13px;font-weight:800;cursor:pointer;">📤 共有 / 写真に保存</button>` : ''}
+        <button id="hb-modal-close" style="flex:1;background:#2c303b;color:#f0f2f5;border:none;border-radius:999px;padding:12px 16px;font-size:13px;font-weight:700;cursor:pointer;">閉じる</button>
+      </div>
     `;
     modal.style.display = 'flex';
+
+    const shareBtn = modal.querySelector('#hb-modal-share');
+    if (shareBtn) {
+      shareBtn.onclick = async () => {
+        try {
+          if (!readyBlob) {
+            const res = await fetch(dataUrl);
+            readyBlob = await res.blob();
+          }
+          const file = new File([readyBlob], filename, { type: 'image/jpeg' });
+          await navigator.share({
+            files: [file],
+            title: 'HASSURUBLAD'
+          });
+        } catch (err) {
+          if (err && err.name !== 'AbortError') {
+            showToast('上の画像を長押しして「写真に保存」してください');
+          }
+        }
+      };
+    }
+
     modal.querySelector('#hb-modal-close').onclick = () => {
       modal.style.display = 'none';
     };
   }
 
-  function downloadCanvas(canvas, filename, titleText = '現像完了') {
-    const dataUrl = canvas.toDataURL('image/jpeg', 0.94);
-    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  // 本体上部の「💾 保存」ボタンを乗っ取ってフル画質保存モーダルへ統一
+  document.addEventListener('click', async (e) => {
+    if (addonState.bypassHostClick) return;
+    const btn = e.target && e.target.closest ? e.target.closest('button') : null;
+    if (!btn) return;
+    if (btn.id && btn.id.startsWith('hb-')) return;
+    if (btn.closest('#hb-addon-drawer') || btn.closest('#hb-save-modal')) return;
 
-    if (!canvas.toBlob) {
-      showImageSaveModal(dataUrl, titleText);
-      return;
-    }
-
-    canvas.toBlob(async (blob) => {
-      if (!blob) {
-        showImageSaveModal(dataUrl, titleText);
-        return;
-      }
-
-      // iPhone / スマホでは共有シート（「画像を保存」）を優先起動
-      if (isMobile && navigator.share) {
-        try {
-          const file = new File([blob], filename, { type: 'image/jpeg' });
-          if (!navigator.canShare || navigator.canShare({ files: [file] })) {
-            await navigator.share({
-              files: [file],
-              title: 'HASSURUBLAD'
-            });
-            showToast('✅ 共有メニューから「画像を保存」を選んでください');
-            return;
-          }
-        } catch (err) {
-          if (err && err.name === 'AbortError') return;
-        }
-      }
-
-      // フォールバック：PCダウンロード or スマホ長押し保存モーダル
-      if (isMobile) {
-        showImageSaveModal(dataUrl, titleText);
+    const txt = (btn.textContent || '').trim();
+    if (txt === '保存' || txt.includes('保存')) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      showToast('⏳ フル画質で現像中...');
+      const fullCanvas = await generateFullResProcessedCanvas();
+      if (fullCanvas) {
+        presentSaveModal(fullCanvas, `hassurublad_${Date.now()}.jpg`, '💾 フル画質現像完了');
       } else {
-        const url = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.download = filename;
-        link.href = url;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-        setTimeout(() => URL.revokeObjectURL(url), 5000);
-        showToast('💾 画像を保存しました！');
+        showToast('⚠️ 画像の書き出しに失敗しました');
       }
-    }, 'image/jpeg', 0.94);
-  }
-
-  document.addEventListener('change', (e) => {
-    if (e.target && e.target.type === 'file' && e.target.files && e.target.files[0]) {
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        addonState.originalDataUrl = ev.target.result;
-      };
-      reader.readAsDataURL(e.target.files[0]);
     }
   }, true);
 
-  function exportBeforeAfter() {
-    const afterCanvas = createProcessedExportCanvas();
+  // ==========================================
+  // 7. Before / After 2枚並べ保存
+  // ==========================================
+  async function exportBeforeAfter() {
+    showToast('⏳ Before / After をフル画質で生成中...');
+    const afterCanvas = await generateFullResProcessedCanvas();
     if (!afterCanvas) {
       showToast('⚠️ 画像が見つかりませんでした');
       return;
     }
 
-    showToast('⏳ Before / After 比較画像を生成中...');
+    const renderCompareCanvas = (beforeSource) => {
+      // 2枚並べてもiOSの上限を超えないよう1枚あたり最大約7.5MPに調整
+      const singleMaxPixels = Math.floor(MAX_CANVAS_PIXELS * 0.45);
+      let w = afterCanvas.width;
+      let h = afterCanvas.height;
+      if (w * h > singleMaxPixels) {
+        const scale = Math.sqrt(singleMaxPixels / (w * h));
+        w = Math.round(w * scale);
+        h = Math.round(h * scale);
+      }
 
-    const buildCompare = (beforeSource) => {
-      const w = afterCanvas.width;
-      const h = afterCanvas.height;
-      const gap = Math.max(8, Math.round(w * 0.02));
-      const labelH = Math.max(32, Math.round(h * 0.065));
+      const gap = Math.max(12, Math.round(w * 0.015));
+      const labelH = Math.max(44, Math.round(h * 0.055));
 
-      const out = document.createElement('canvas');
-      out.width = w * 2 + gap;
-      out.height = h + labelH;
+      const out = createInternalCanvas(w * 2 + gap, h + labelH);
       const ctx = out.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
 
       ctx.fillStyle = '#0e0f12';
       ctx.fillRect(0, 0, out.width, out.height);
 
       if (beforeSource) {
-        origDrawImage.call(ctx, beforeSource, 0, 0, w, h);
+        // 6x6時はBEFORE側も中央正方形に揃えて見栄えを統一
+        const bDims = getSourceDimensions(beforeSource);
+        if (addonState.frameMode === '6x6' && bDims.w > 0 && bDims.h > 0 && bDims.w !== bDims.h) {
+          const sq = Math.min(bDims.w, bDims.h);
+          origDrawImage.call(
+            ctx,
+            beforeSource,
+            (bDims.w - sq) / 2,
+            (bDims.h - sq) / 2,
+            sq,
+            sq,
+            0,
+            0,
+            w,
+            h
+          );
+        } else {
+          origDrawImage.call(ctx, beforeSource, 0, 0, w, h);
+        }
       }
       origDrawImage.call(ctx, afterCanvas, w + gap, 0, w, h);
 
       ctx.fillStyle = '#949ba8';
-      ctx.font = `bold ${Math.max(14, Math.round(labelH * 0.45))}px sans-serif`;
+      ctx.font = `bold ${Math.max(16, Math.round(labelH * 0.45))}px sans-serif`;
       ctx.textAlign = 'center';
       ctx.fillText('BEFORE', w / 2, h + labelH * 0.68);
 
       ctx.fillStyle = '#f5a623';
       ctx.fillText('AFTER  •  HASSURUBLAD', w + gap + w / 2, h + labelH * 0.68);
 
-      downloadCanvas(out, `hassurublad_compare_${Date.now()}.jpg`, '🌓 Before / After 比較画像');
+      presentSaveModal(out, `hassurublad_compare_${Date.now()}.jpg`, '🌓 Before / After 比較画像');
     };
 
-    const srcUrl = addonState.originalDataUrl || (cleanCanvas.width ? cleanCanvas.toDataURL('image/jpeg', 0.9) : null);
-    if (!srcUrl) {
-      buildCompare(cleanCanvas.width ? cleanCanvas : afterCanvas);
+    if (addonState.originalBitmap) {
+      renderCompareCanvas(addonState.originalBitmap);
       return;
     }
 
-    const img = new Image();
-    img.onload = () => buildCompare(img);
-    img.onerror = () => buildCompare(cleanCanvas.width ? cleanCanvas : afterCanvas);
-    img.src = srcUrl;
+    if (addonState.originalDataUrl) {
+      const img = new Image();
+      img.onload = () => renderCompareCanvas(img);
+      img.onerror = () => renderCompareCanvas(cleanCanvas.width ? cleanCanvas : afterCanvas);
+      img.src = addonState.originalDataUrl;
+      return;
+    }
+
+    renderCompareCanvas(cleanCanvas.width ? cleanCanvas : afterCanvas);
   }
 
   // ==========================================
-  // 6. Myレシピ（スライダー＆エフェクト保存）
+  // 8. Myレシピ（スライダー＆エフェクト保存）
   // ==========================================
   function getAllSliders() {
     return Array.from(document.querySelectorAll('input[type="range"]')).filter(
@@ -690,9 +959,12 @@
         leakOpacity: addonState.leakOpacity
       }
     };
-    saveJson(STORAGE_RECIPES, myRecipes);
-    renderDrawerBody();
-    showToast(`💾「${myRecipes[slotIdx].name}」を保存しました`);
+    if (saveJson(STORAGE_RECIPES, myRecipes)) {
+      renderDrawerBody();
+      showToast(`💾「${myRecipes[slotIdx].name}」を保存しました`);
+    } else {
+      showToast('⚠️ 保存容量がいっぱいです');
+    }
   }
 
   function loadRecipe(slotIdx) {
@@ -717,7 +989,7 @@
   }
 
   // ==========================================
-  // 7. シェイクでおまかせ現像
+  // 9. シェイクでおまかせ現像
   // ==========================================
   let lastShakeTime = 0;
 
@@ -788,29 +1060,34 @@
   }
 
   // ==========================================
-  // 8. フィルム24枚撮り切りモード（コンタクトシート）
+  // 10. フィルム24枚撮り切りモード（コンタクトシート）
   // ==========================================
   function shootToFilmRoll() {
     if (filmRoll.length >= 24) {
       showToast('🎞️ 24枚撮り切りました！コンタクトシートを現像できます');
       return;
     }
-    const src = createProcessedExportCanvas();
+    const src = getMainCanvas();
     if (!src) return;
 
     triggerShutterFlash();
 
-    const thumbW = 240;
+    // 24枚保存してもlocalStorage(5MB)を圧迫しない最適サイズ (約20KB/枚)
+    const thumbW = 320;
     const thumbH = Math.round((src.height / src.width) * thumbW);
-    const tCanvas = document.createElement('canvas');
-    tCanvas.width = thumbW;
-    tCanvas.height = thumbH;
+    const tCanvas = createInternalCanvas(thumbW, thumbH);
     origDrawImage.call(tCanvas.getContext('2d'), src, 0, 0, thumbW, thumbH);
 
-    filmRoll.push(tCanvas.toDataURL('image/jpeg', 0.78));
-    saveJson(STORAGE_ROLL, filmRoll);
-    renderDrawerBody();
+    const compressed = origToDataURL.call(tCanvas, 'image/jpeg', 0.75);
+    filmRoll.push(compressed);
 
+    if (!saveJson(STORAGE_ROLL, filmRoll)) {
+      filmRoll.pop();
+      showToast('⚠️ ブラウザ保存容量の上限に達しました。現像してリセットしてください');
+      return;
+    }
+
+    renderDrawerBody();
     const left = 24 - filmRoll.length;
     if (left === 0) {
       showToast('🎉 24枚撮り切り完了！「コンタクトシート現像」を押そう！');
@@ -827,22 +1104,20 @@
 
     const cols = 4;
     const rows = 6;
-    const cellW = 260;
-    const cellH = 260;
-    const pad = 24;
-    const headerH = 80;
+    const cellW = 420;
+    const cellH = 420;
+    const pad = 36;
+    const headerH = 110;
 
-    const out = document.createElement('canvas');
-    out.width = cols * cellW + pad * 2;
-    out.height = rows * cellH + headerH + pad;
+    const out = createInternalCanvas(cols * cellW + pad * 2, rows * cellH + headerH + pad);
     const ctx = out.getContext('2d');
 
     ctx.fillStyle = '#090a0d';
     ctx.fillRect(0, 0, out.width, out.height);
 
     ctx.fillStyle = '#f5a623';
-    ctx.font = 'bold 26px monospace';
-    ctx.fillText('HASSURUBLAD  •  CONTACT SHEET (24 EXP)', pad, 48);
+    ctx.font = 'bold 36px monospace';
+    ctx.fillText('HASSURUBLAD  •  CONTACT SHEET (24 EXP)', pad, 68);
 
     let loaded = 0;
     filmRoll.forEach((dataUrl, idx) => {
@@ -854,26 +1129,26 @@
         const y = headerH + r * cellH;
 
         ctx.fillStyle = '#f5a623';
-        ctx.font = 'bold 13px monospace';
-        ctx.fillText(`#${String(idx + 1).padStart(2, '0')}A`, x + 10, y + 18);
+        ctx.font = 'bold 18px monospace';
+        ctx.fillText(`#${String(idx + 1).padStart(2, '0')}A`, x + 14, y + 24);
 
-        const boxW = cellW - 20;
-        const boxH = cellH - 36;
+        const boxW = cellW - 28;
+        const boxH = cellH - 48;
         const ratio = Math.min(boxW / img.width, boxH / img.height);
         const dw = img.width * ratio;
         const dh = img.height * ratio;
         origDrawImage.call(
           ctx,
           img,
-          x + 10 + (boxW - dw) / 2,
-          y + 24 + (boxH - dh) / 2,
+          x + 14 + (boxW - dw) / 2,
+          y + 32 + (boxH - dh) / 2,
           dw,
           dh
         );
 
         loaded++;
         if (loaded === filmRoll.length) {
-          downloadCanvas(out, `hassurublad_contact_sheet_${Date.now()}.jpg`, '🎞️ コンタクトシート');
+          presentSaveModal(out, `hassurublad_contact_sheet_${Date.now()}.jpg`, '🎞️ コンタクトシート現像完了');
         }
       };
       img.src = dataUrl;
@@ -881,7 +1156,7 @@
   }
 
   // ==========================================
-  // 9. UIパネル構築
+  // 11. UIパネル構築
   // ==========================================
   const fab = document.createElement('button');
   fab.id = 'hb-addon-fab';
@@ -895,6 +1170,7 @@
       <div class="hb-tabs">
         <button class="hb-tab active" data-tab="effects">2. エフェクト</button>
         <button class="hb-tab" data-tab="tools">3. ツール・遊び</button>
+        <span class="hb-ver-badge">${ADDON_VERSION}</span>
       </div>
       <button class="hb-close" id="hb-close-btn">✕</button>
     </div>
@@ -959,7 +1235,7 @@
           <input type="range" id="hb-leak-slider" min="0.2" max="1" step="0.05" value="${addonState.leakOpacity}" style="width:100%;margin-top:8px;">
         </div>
 
-        <button class="hb-action-btn" id="hb-export-effect">💾 エフェクト付きで高画質保存</button>
+        <button class="hb-action-btn" id="hb-export-effect">💾 フル画質で保存（エフェクト適用）</button>
       `;
 
       body.querySelectorAll('[data-date]').forEach((btn) => {
@@ -1001,10 +1277,11 @@
         applyVisualsFromClean();
       });
 
-      body.querySelector('#hb-export-effect').addEventListener('click', () => {
-        const c = createProcessedExportCanvas();
+      body.querySelector('#hb-export-effect').addEventListener('click', async () => {
+        showToast('⏳ フル画質で現像中...');
+        const c = await generateFullResProcessedCanvas();
         if (c) {
-          downloadCanvas(c, `hassurublad_film_${Date.now()}.jpg`, '💾 エフェクト適用済み写真');
+          presentSaveModal(c, `hassurublad_film_${Date.now()}.jpg`, '💾 フル画質現像写真');
         }
       });
     } else {
