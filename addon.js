@@ -22,6 +22,9 @@
   let filmRoll = loadJson(STORAGE_ROLL, []);
   let myRecipes = loadJson(STORAGE_RECIPES, [null, null, null, null, null]);
 
+  // エフェクト適用前の「素の現像画像」を保持する裏キャンバス
+  const cleanCanvas = document.createElement('canvas');
+
   function loadJson(key, fallback) {
     try {
       const raw = localStorage.getItem(key);
@@ -44,7 +47,53 @@
   }
 
   // ==========================================
-  // 2. スタイル注入（本体デザインに統一）
+  // 2. 本体キャンバスの更新検知（無限重ね描き防止）
+  // ==========================================
+  const origDrawImage = CanvasRenderingContext2D.prototype.drawImage;
+  const origPutImageData = CanvasRenderingContext2D.prototype.putImageData;
+  let hostRenderScheduled = false;
+
+  function captureCleanCanvas() {
+    const main = getMainCanvas();
+    if (!main || !main.width || !main.height) return;
+    cleanCanvas.width = main.width;
+    cleanCanvas.height = main.height;
+    origDrawImage.call(cleanCanvas.getContext('2d'), main, 0, 0);
+
+    if (!addonState.originalDataUrl) {
+      addonState.originalDataUrl = cleanCanvas.toDataURL('image/jpeg', 0.9);
+    }
+  }
+
+  function onHostCanvasDraw(ctx) {
+    const main = getMainCanvas();
+    if (!main || ctx.canvas !== main || addonState.isApplying) return;
+
+    if (!hostRenderScheduled) {
+      hostRenderScheduled = true;
+      // 本体の1フレーム分の描画がすべて完了した直後に1回だけ処理する
+      setTimeout(() => {
+        hostRenderScheduled = false;
+        captureCleanCanvas();
+        applyVisualsFromClean();
+      }, 0);
+    }
+  }
+
+  CanvasRenderingContext2D.prototype.drawImage = function (...args) {
+    const res = origDrawImage.apply(this, args);
+    onHostCanvasDraw(this);
+    return res;
+  };
+
+  CanvasRenderingContext2D.prototype.putImageData = function (...args) {
+    const res = origPutImageData.apply(this, args);
+    onHostCanvasDraw(this);
+    return res;
+  };
+
+  // ==========================================
+  // 3. スタイル注入（本体デザインに統一）
   // ==========================================
   const style = document.createElement('style');
   style.textContent = `
@@ -273,14 +322,14 @@
   }
 
   // ==========================================
-  // 3. ビジュアルエフェクト描画エンジン
+  // 4. ビジュアルエフェクト描画エンジン（必ず素の画像から1回だけ描画）
   // ==========================================
   function seededRandom(seed) {
     const x = Math.sin(seed * 9999.91) * 10000;
     return x - Math.floor(x);
   }
 
-  function renderEffectsOnCanvas(ctx, w, h, isExport = false) {
+  function renderEffectsOnCanvas(ctx, w, h) {
     // --- A. ライトリーク（光漏れ） ---
     if (addonState.leakSeed > 0) {
       ctx.save();
@@ -313,11 +362,10 @@
     let contentRect = { x: 0, y: 0, w, h };
 
     if (addonState.frameMode === '6x6') {
-      // プレビュー時は中央正方形を切り出し黒ネガ縁を表示
       const temp = document.createElement('canvas');
       temp.width = w;
       temp.height = h;
-      temp.getContext('2d').drawImage(ctx.canvas, 0, 0);
+      origDrawImage.call(temp.getContext('2d'), ctx.canvas, 0, 0);
 
       const sq = Math.min(w, h);
       const sx = (w - sq) / 2;
@@ -332,9 +380,9 @@
       const dx = (w - sq) / 2 + border;
       const dy = (h - sq) / 2 + border;
 
-      ctx.drawImage(temp, sx, sy, sq, sq, dx, dy, inner, inner);
+      origDrawImage.call(ctx, temp, sx, sy, sq, sq, dx, dy, inner, inner);
 
-      // ハッセルブラッド風 Vノッチ（左辺の2つの切り欠き）
+      // ハッセルブラッド風 Vノッチ
       ctx.fillStyle = '#09090b';
       [0.28, 0.72].forEach((pos) => {
         ctx.beginPath();
@@ -346,7 +394,7 @@
       });
 
       // フィルムエッジ印字
-      ctx.fillStyle = 'rgba(245, 166, 35, 0.75)';
+      ctx.fillStyle = 'rgba(245, 166, 35, 0.8)';
       ctx.font = `bold ${Math.max(9, Math.round(border * 0.36))}px monospace`;
       ctx.fillText('HASSURUBLAD 6x6   120 FILM   ► 12', dx, dy - border * 0.3);
 
@@ -356,7 +404,7 @@
       const temp = document.createElement('canvas');
       temp.width = w;
       temp.height = h;
-      temp.getContext('2d').drawImage(ctx.canvas, 0, 0);
+      origDrawImage.call(temp.getContext('2d'), ctx.canvas, 0, 0);
 
       ctx.save();
       ctx.fillStyle = '#f4f2ed';
@@ -365,7 +413,7 @@
       const bottomPad = Math.round(h * 0.16);
       const iw = w - pad * 2;
       const ih = h - pad - bottomPad;
-      ctx.drawImage(temp, 0, 0, w, h, pad, pad, iw, ih);
+      origDrawImage.call(ctx, temp, 0, 0, w, h, pad, pad, iw, ih);
       contentRect = { x: pad, y: pad, w: iw, h: ih };
       ctx.restore();
     } else if (addonState.frameMode === 'cinema') {
@@ -405,65 +453,76 @@
       const tx = contentRect.x + contentRect.w - fontSize * 0.9;
       const ty = contentRect.y + contentRect.h - fontSize * 0.7;
       ctx.fillText(dateText, tx, ty);
-      ctx.fillText(dateText, tx, ty); // 二重描画で発光感アップ
+      ctx.fillText(dateText, tx, ty);
       ctx.restore();
     }
   }
 
-  function applyVisualsToMainCanvas() {
+  function applyVisualsFromClean() {
     if (addonState.isApplying) return;
     const canvas = getMainCanvas();
-    if (!canvas || !canvas.width || !canvas.height) return;
-
-    const hasEffect =
-      addonState.dateMode !== 'off' ||
-      addonState.frameMode !== 'off' ||
-      addonState.leakSeed > 0;
-
-    if (!hasEffect) return;
+    if (!canvas) return;
+    if (!cleanCanvas.width || !cleanCanvas.height) {
+      captureCleanCanvas();
+    }
+    if (!cleanCanvas.width || !cleanCanvas.height) return;
 
     addonState.isApplying = true;
     try {
       const ctx = canvas.getContext('2d');
-      renderEffectsOnCanvas(ctx, canvas.width, canvas.height, false);
+      // 毎回必ず「素の画像」でキャンバスをリセットしてから描く
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      origDrawImage.call(ctx, cleanCanvas, 0, 0);
+
+      const hasEffect =
+        addonState.dateMode !== 'off' ||
+        addonState.frameMode !== 'off' ||
+        addonState.leakSeed > 0;
+
+      if (hasEffect) {
+        renderEffectsOnCanvas(ctx, canvas.width, canvas.height);
+      }
     } finally {
       addonState.isApplying = false;
     }
   }
 
-  // 既存操作の直後に自動でエフェクトを重ねる
-  function scheduleApply() {
-    requestAnimationFrame(() => {
-      applyVisualsToMainCanvas();
-    });
-  }
-
-  ['input', 'change', 'click', 'touchend', 'mouseup'].forEach((evt) => {
-    document.addEventListener(evt, scheduleApply, true);
-  });
+  // 初回ロード時にすでに描画済みの場合のバックアップ
+  setTimeout(() => {
+    if (!cleanCanvas.width) captureCleanCanvas();
+  }, 200);
 
   // ==========================================
-  // 4. 書き出し・Before/After・コンタクトシート生成
+  // 5. 書き出し・Before/After・コンタクトシート生成
   // ==========================================
   function createProcessedExportCanvas() {
     const src = getMainCanvas();
     if (!src) return null;
 
-    // 6x6モードの書き出し時は真四角(1:1)の綺麗なキャンバスを生成
     if (addonState.frameMode === '6x6') {
       const sq = Math.min(src.width, src.height);
       const out = document.createElement('canvas');
       out.width = sq;
       out.height = sq;
-      const ctx = out.getContext('2d');
-      ctx.drawImage(src, (src.width - sq) / 2, (src.height - sq) / 2, sq, sq, 0, 0, sq, sq);
+      origDrawImage.call(
+        out.getContext('2d'),
+        src,
+        (src.width - sq) / 2,
+        (src.height - sq) / 2,
+        sq,
+        sq,
+        0,
+        0,
+        sq,
+        sq
+      );
       return out;
     }
 
     const out = document.createElement('canvas');
     out.width = src.width;
     out.height = src.height;
-    out.getContext('2d').drawImage(src, 0, 0);
+    origDrawImage.call(out.getContext('2d'), src, 0, 0);
     return out;
   }
 
@@ -473,15 +532,6 @@
     link.href = canvas.toDataURL('image/jpeg', 0.94);
     link.click();
   }
-
-  // 元画像の自動キャプチャ（Before/After用）
-  function captureInitialOriginal() {
-    const c = getMainCanvas();
-    if (c && c.width > 0 && !addonState.originalDataUrl) {
-      addonState.originalDataUrl = c.toDataURL('image/jpeg', 0.9);
-    }
-  }
-  setTimeout(captureInitialOriginal, 400);
 
   document.addEventListener('change', (e) => {
     if (e.target && e.target.type === 'file' && e.target.files && e.target.files[0]) {
@@ -512,8 +562,8 @@
       ctx.fillStyle = '#0e0f12';
       ctx.fillRect(0, 0, out.width, out.height);
 
-      ctx.drawImage(img, 0, 0, w, h);
-      ctx.drawImage(afterCanvas, w + gap, 0, w, h);
+      origDrawImage.call(ctx, img, 0, 0, w, h);
+      origDrawImage.call(ctx, afterCanvas, w + gap, 0, w, h);
 
       ctx.fillStyle = '#949ba8';
       ctx.font = `bold ${Math.max(14, Math.round(labelH * 0.45))}px sans-serif`;
@@ -526,11 +576,11 @@
       downloadCanvas(out, `hassurublad_compare_${Date.now()}.jpg`);
       showToast('🌓 Before / After 比較画像を保存しました！');
     };
-    img.src = addonState.originalDataUrl || afterCanvas.toDataURL('image/jpeg', 0.9);
+    img.src = addonState.originalDataUrl || cleanCanvas.toDataURL('image/jpeg', 0.9);
   }
 
   // ==========================================
-  // 5. Myレシピ（スライダー＆エフェクト保存）
+  // 6. Myレシピ（スライダー＆エフェクト保存）
   // ==========================================
   function getAllSliders() {
     return Array.from(document.querySelectorAll('input[type="range"]')).filter(
@@ -576,13 +626,13 @@
     if (rec.addon) {
       Object.assign(addonState, rec.addon);
     }
-    scheduleApply();
+    applyVisualsFromClean();
     renderDrawerBody();
     showToast(`✨「${rec.name}」を呼び出しました`);
   }
 
   // ==========================================
-  // 6. シェイクでおまかせ現像
+  // 7. シェイクでおまかせ現像
   // ==========================================
   let lastShakeTime = 0;
 
@@ -595,7 +645,6 @@
       const min = parseFloat(s.min || 0);
       const max = parseFloat(s.max || 100);
       const step = parseFloat(s.step || 1);
-      // 極端になりすぎないよう中央65%の範囲でランダム化
       const center = (min + max) / 2;
       const span = (max - min) * 0.65;
       let val = center + (Math.random() - 0.5) * span;
@@ -604,13 +653,12 @@
       s.dispatchEvent(new Event('input', { bubbles: true }));
     });
 
-    // 40%の確率でランダム光漏れも追加
     if (Math.random() < 0.4) {
       addonState.leakSeed = Math.floor(Math.random() * 1000) + 1;
     } else {
       addonState.leakSeed = 0;
     }
-    scheduleApply();
+    applyVisualsFromClean();
     renderDrawerBody();
     if (navigator.vibrate) navigator.vibrate([30, 40, 30]);
     showToast('🎲 おまかせ現像を実行しました！');
@@ -655,7 +703,7 @@
   }
 
   // ==========================================
-  // 7. フィルム24枚撮り切りモード（コンタクトシート）
+  // 8. フィルム24枚撮り切りモード（コンタクトシート）
   // ==========================================
   function shootToFilmRoll() {
     if (filmRoll.length >= 24) {
@@ -667,13 +715,12 @@
 
     triggerShutterFlash();
 
-    // サムネイル圧縮保存
     const thumbW = 240;
     const thumbH = Math.round((src.height / src.width) * thumbW);
     const tCanvas = document.createElement('canvas');
     tCanvas.width = thumbW;
     tCanvas.height = thumbH;
-    tCanvas.getContext('2d').drawImage(src, 0, 0, thumbW, thumbH);
+    origDrawImage.call(tCanvas.getContext('2d'), src, 0, 0, thumbW, thumbH);
 
     filmRoll.push(tCanvas.toDataURL('image/jpeg', 0.78));
     saveJson(STORAGE_ROLL, filmRoll);
@@ -730,7 +777,8 @@
         const ratio = Math.min(boxW / img.width, boxH / img.height);
         const dw = img.width * ratio;
         const dh = img.height * ratio;
-        ctx.drawImage(
+        origDrawImage.call(
+          ctx,
           img,
           x + 10 + (boxW - dw) / 2,
           y + 24 + (boxH - dh) / 2,
@@ -749,7 +797,7 @@
   }
 
   // ==========================================
-  // 8. UIパネル構築
+  // 9. UIパネル構築
   // ==========================================
   const fab = document.createElement('button');
   fab.id = 'hb-addon-fab';
@@ -771,7 +819,7 @@
   document.body.appendChild(drawer);
 
   fab.addEventListener('click', () => {
-    captureInitialOriginal();
+    if (!cleanCanvas.width) captureCleanCanvas();
     drawer.classList.add('open');
     renderDrawerBody();
   });
@@ -838,7 +886,7 @@
             if (val !== null && val.trim()) addonState.customDate = val.trim();
           }
           addonState.dateMode = mode;
-          scheduleApply();
+          applyVisualsFromClean();
           renderDrawerBody();
         });
       });
@@ -846,27 +894,27 @@
       body.querySelectorAll('[data-frame]').forEach((btn) => {
         btn.addEventListener('click', () => {
           addonState.frameMode = btn.dataset.frame;
-          scheduleApply();
+          applyVisualsFromClean();
           renderDrawerBody();
         });
       });
 
       body.querySelector('#hb-leak-gen').addEventListener('click', () => {
         addonState.leakSeed = Math.floor(Math.random() * 10000) + 1;
-        scheduleApply();
+        applyVisualsFromClean();
         renderDrawerBody();
       });
 
       body.querySelector('#hb-leak-off').addEventListener('click', () => {
         addonState.leakSeed = 0;
-        scheduleApply();
+        applyVisualsFromClean();
         renderDrawerBody();
       });
 
       body.querySelector('#hb-leak-slider').addEventListener('input', (e) => {
         addonState.leakOpacity = parseFloat(e.target.value);
         if (addonState.leakSeed === 0) addonState.leakSeed = 1;
-        scheduleApply();
+        applyVisualsFromClean();
       });
 
       body.querySelector('#hb-export-effect').addEventListener('click', () => {
@@ -877,7 +925,6 @@
         }
       });
     } else {
-      // Tab 3: ツール・遊び
       const slotsHtml = myRecipes
         .map((rec, i) => {
           if (rec) {
@@ -959,4 +1006,3 @@
     }
   }
 })();
-
